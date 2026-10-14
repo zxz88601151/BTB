@@ -52,6 +52,32 @@ func TestValidateAndMine(t *testing.T) {
 	}
 }
 
+// MineParallel：多 worker 挖出的解 Validate 通过；结果与单线程 Mine 等价（同难度下均满足目标）。
+func TestMineParallel(t *testing.T) {
+	coinbase := transaction.NewCoinbaseTx([20]byte{1, 2, 3}, params.GetBlockSubsidy(1))
+	b := block.NewCandidateBlock([32]byte{}, 0x207fffff, []*transaction.Transaction{coinbase})
+	found, attempts := MineParallel(b, 4)
+	if !found {
+		t.Fatalf("MineParallel 未找到解")
+	}
+	if attempts == 0 {
+		t.Fatalf("attempts 应 > 0")
+	}
+	if !Validate(&b.Header) {
+		t.Fatalf("MineParallel 挖出的解 Validate 应通过")
+	}
+}
+
+// MineParallel 单 worker 应与 Mine 等价（退化为单线程路径）。
+func TestMineParallelSingleWorker(t *testing.T) {
+	coinbase := transaction.NewCoinbaseTx([20]byte{1, 2, 3}, params.GetBlockSubsidy(1))
+	b := block.NewCandidateBlock([32]byte{}, 0x207fffff, []*transaction.Transaction{coinbase})
+	found, _ := MineParallel(b, 1)
+	if !found || !Validate(&b.Header) {
+		t.Fatalf("MineParallel(1) 应找到有效解")
+	}
+}
+
 // HashMeetsTarget 小端语义：全零哈希通过任何正目标；目标 0 拒绝任何哈希。
 func TestHashMeetsTargetEdge(t *testing.T) {
 	var zero [32]byte

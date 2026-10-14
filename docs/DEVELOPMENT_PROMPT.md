@@ -58,6 +58,15 @@ hundun/
 
 以下每张"任务卡片"都是独立可执行的开发任务，包含目标、验收标准、注意事项。建议按顺序推进。
 
+> **状态（2026-10-14）：六张卡已全部实现（`go build/vet/test` 全过 + 联调 `internal/integration` 通过），未推送。**
+> 与卡片原文有出入处如实标注，不静默声称全合规：
+> - 卡 1：UTXO 为独立 `internal/utxo` 包（卡片说放 `blockchain` 内）；另新增 BIP-30 式防重复 Coinbase 校验（卡片未提，防相同 Coinbase TxID 碰撞覆盖 UTXO）。
+> - 卡 3：入池时**检查**池内双花冲突（卡片原文说“不看冲突”；本实现按无 RBF 直接拒绝冲突交易，更严）。
+> - 卡 4：未做 30 秒心跳检测、未做单 IP 段连接数限制（Sybil 防护仅有评分/封禁；心跳与 IP 段限制仍 TODO）。
+> - 卡 5：按高度区间批量同步（卡片原文为按哈希 Inv 请求；本实现按 `fromHeight+count` 批量，边下载边校验已实现）。
+> - 卡 6：未做“新区块到达立即中断挖矿”（context 取消仍 TODO，当前靠每轮重组装响应）、未做算力统计展示（TODO）。
+> - 同步中重组挤出的交易未自动放回 Mempool（IBD 路径丢弃，发送方重广播；实时 OnNewBlock 路径已放回）。
+
 ### 任务卡片 1：UTXO 集合与交易校验
 
 **目标**：在 `internal/blockchain` 中实现 UTXO 集合的维护，替换掉 `ValidateBlock` 中的 TODO。

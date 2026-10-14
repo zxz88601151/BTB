@@ -1,0 +1,23 @@
+# Block / tx data directory (default DataDir from internal/config/config.go:20)
+data/
+
+# Build artifacts
+p2pchain
+node
+*.exe
+*.test
+*.out
+
+# Logs
+*.log
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

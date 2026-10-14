@@ -1,8 +1,8 @@
 // cmd/node 是节点的可执行程序入口。
 //
 // 运行流程：
-//  1. 载入硬编码创世块（genesis 包），初始化内存版区块链 + UTXO
-//  2. 生成（或加载）矿工钱包
+//  1. 载入硬编码创世块（genesis 包），初始化区块链 + UTXO；打开 Pebble 持久化，重放恢复
+//  2. 加载或生成矿工钱包（datadir/wallet.json；口令文件给定则加密保存）
 //  3. 启动 P2P 监听 + 连接种子节点（断线指数退避重连）
 //  4. 同步：落后时先同步（WAITING_SYNC 门禁，矿工不挖矿），同步完成后再挖矿
 //  5. 挖矿循环：Mempool 按费率打包 + Coinbase（补贴 + 费和）→ 并行挖矿 → 上链广播
@@ -27,6 +27,7 @@ import (
 	"hundun/internal/p2p"
 	"hundun/internal/params"
 	"hundun/internal/pow"
+	"hundun/internal/storage"
 	chainsync "hundun/internal/sync"
 	"hundun/internal/transaction"
 	"hundun/internal/wallet"
@@ -39,11 +40,33 @@ type nodeService struct {
 	miner  *wallet.Wallet
 	pool   *mempool.Pool
 	syncer *chainsync.Syncer
+	store  *storage.PebbleStore // P1：持久化后端（nil 表示未启用持久化，兼容单测）
 
 	mu          sync.Mutex
 	peerHeights map[string]int
 	pending     map[string]chan p2p.BlocksRespPayload
 	pendingSeq  int
+}
+
+// persistTip 把当前链尾块持久化到 Pebble（高度 + 最佳哈希原子推进）。
+// 重组后链尾变化时同样调用：SaveBlockAtHeight 覆盖同高度旧块，SetBest 推进。
+func (s *nodeService) persistTip() {
+	if s.store == nil {
+		return
+	}
+	tip, err := s.chain.Tip()
+	if err != nil {
+		log.Printf("[store] 获取链尾失败，未持久化: %v", err)
+		return
+	}
+	h := s.chain.Height()
+	if err := s.store.SaveBlockAtHeight(tip, h); err != nil {
+		log.Printf("[store] 持久化高度 %d 失败: %v", h, err)
+		return
+	}
+	if err := s.store.SetBest(h, tip.Header.Hash()); err != nil {
+		log.Printf("[store] 推进最佳高度失败: %v", err)
+	}
 }
 
 // OnHandshake 握手处理：记录对端高度；若对端更高且未在同步，启动同步。
@@ -93,7 +116,8 @@ func (s *nodeService) OnNewBlock(peerAddr string, raw json.RawMessage) {
 		s.net.ReportBadPeer(peerAddr, p2p.BadBlockScore)
 		return
 	}
-	// 上链成功：Mempool 移除已确认交易，清理失效交易，重组挤出的交易放回池。
+	// 上链成功：持久化链尾；Mempool 移除已确认交易，清理失效交易，重组挤出的交易放回池。
+	s.persistTip()
 	s.pool.RemoveConfirmed(b.Transactions)
 	s.pool.Prune(s.chain.UTXOSet())
 	for _, tx := range displaced {
@@ -270,6 +294,7 @@ func mineLoop(s *nodeService) {
 		}
 		log.Printf("[miner] 挖到新区块！高度=%d 哈希=%s 尝试次数=%d",
 			s.chain.Height(), candidate.Header.HashHex(), attempts)
+		s.persistTip()
 		s.pool.RemoveConfirmed(candidate.Transactions)
 		s.pool.Prune(s.chain.UTXOSet())
 		s.broadcastBlock(candidate)
@@ -309,13 +334,65 @@ func reconnectLoop(n *p2p.Node, seedAddr string) {
 	}
 }
 
+// readPasswordFile 读取口令文件：文件须为 0600 权限，否则拒绝启动
+// （口令只走 --wallet-password-file，见 P2）；返回去空白后的口令。
+func readPasswordFile(path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		log.Fatalf("读取口令文件失败: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		log.Fatalf("口令文件 %s 权限为 %o，须为 0600（chmod 600 后再启动）", path, info.Mode().Perm())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("读取口令文件失败: %v", err)
+	}
+	return string(trimSpaceBytes(data))
+}
+
+func trimSpaceBytes(b []byte) []byte {
+	start := 0
+	for start < len(b) && (b[start] == ' ' || b[start] == '\t' || b[start] == '\n' || b[start] == '\r') {
+		start++
+	}
+	end := len(b)
+	for end > start && (b[end-1] == ' ' || b[end-1] == '\t' || b[end-1] == '\n' || b[end-1] == '\r') {
+		end--
+	}
+	return b[start:end]
+}
+
 func main() {
 	listenAddr := flag.String("listen", ":6688", "本节点监听地址")
 	seedAddr := flag.String("seed", "", "种子节点地址，留空表示作为第一个节点启动")
+	dataDir := flag.String("datadir", "./data", "数据目录（Pebble 链库 + 钱包文件）")
+	passwordFile := flag.String("wallet-password-file", "", "钱包口令文件（须 0600 权限；为空表示钱包文件不加密，仅开发调试用）")
+	tlsEnabled := flag.Bool("tls", false, "启用 mTLS（P4，生产设 true，需配齐 --tls-cert/--tls-key/--tls-ca）")
+	tlsCert := flag.String("tls-cert", "", "节点证书 PEM 文件")
+	tlsKey := flag.String("tls-key", "", "节点私钥 PEM 文件")
+	tlsCA := flag.String("tls-ca", "", "信任的 CA 证书 PEM 文件")
 	flag.Parse()
 
 	cfg := config.DefaultConfig()
 	cfg.ListenAddr = *listenAddr
+	cfg.DataDir = *dataDir
+	cfg.WalletPasswordFile = *passwordFile
+	cfg.TLSEnabled = *tlsEnabled
+	cfg.TLSCertFile = *tlsCert
+	cfg.TLSKeyFile = *tlsKey
+	cfg.TLSCAFile = *tlsCA
+
+	// 数据目录：Pebble 链库与钱包文件均落于此。
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		log.Fatalf("创建数据目录失败: %v", err)
+	}
+
+	// 口令：只从口令文件读，绝不从命令行参数 / 环境变量读。
+	password := ""
+	if cfg.WalletPasswordFile != "" {
+		password = readPasswordFile(cfg.WalletPasswordFile)
+	}
 
 	// 载入硬编码创世块（回填前拒绝启动，见 genesis 包）。
 	genesisBlock, err := genesis.GenesisBlock()
@@ -328,9 +405,59 @@ func main() {
 	chain := blockchain.NewBlockchainWithGenesis(genesisBlock)
 	log.Printf("[node] 创世区块哈希=%s", genesisBlock.Header.HashHex())
 
-	minerWallet, err := wallet.NewWallet()
+	// P1 持久化：打开 Pebble，空库写入创世块；非空库按高度重放恢复。
+	store, err := storage.Open(cfg.DataDir + "/chain.db")
 	if err != nil {
-		log.Fatalf("生成矿工钱包失败: %v", err)
+		log.Fatalf("打开 Pebble 数据库失败: %v", err)
+	}
+	defer func() {
+		_ = store.Flush()
+		_ = store.Close()
+	}()
+	storedHeight, err := store.Height()
+	if err != nil {
+		log.Fatalf("读取持久化高度失败: %v", err)
+	}
+	if storedHeight < 0 {
+		if err := store.SaveBlockAtHeight(genesisBlock, 0); err != nil {
+			log.Fatalf("持久化创世块失败: %v", err)
+		}
+		if err := store.SetBest(0, genesisBlock.Header.Hash()); err != nil {
+			log.Fatalf("持久化最佳高度失败: %v", err)
+		}
+		log.Printf("[store] 空库已初始化创世块")
+	} else {
+		for h := 1; h <= storedHeight; h++ {
+			b, err := store.GetBlockByHeight(h)
+			if err != nil {
+				log.Fatalf("重放高度 %d 失败: %v", h, err)
+			}
+			if _, _, err := chain.AddBlockWithResult(b); err != nil {
+				log.Fatalf("重放高度 %d 校验失败: %v", h, err)
+			}
+		}
+		log.Printf("[store] 重放完成：持久化高度=%d，内存链高度=%d", storedHeight, chain.Height())
+	}
+
+	// P2 钱包：datadir/wallet.json 存在则加载，否则新建并保存
+	// （口令文件给定则加密保存，否则明文 JSON 保存，均为 0600）。
+	walletPath := cfg.DataDir + "/wallet.json"
+	var minerWallet *wallet.Wallet
+	if _, err := os.Stat(walletPath); err == nil {
+		minerWallet, err = wallet.LoadWalletFile(walletPath, password)
+		if err != nil {
+			log.Fatalf("加载钱包文件失败: %v", err)
+		}
+		log.Printf("[node] 已加载钱包文件 %s", walletPath)
+	} else {
+		minerWallet, err = wallet.NewWallet()
+		if err != nil {
+			log.Fatalf("生成矿工钱包失败: %v", err)
+		}
+		if err := wallet.SaveWalletFile(walletPath, minerWallet, password); err != nil {
+			log.Fatalf("保存钱包文件失败: %v", err)
+		}
+		log.Printf("[node] 新建钱包已保存到 %s（%s）", walletPath, map[bool]string{true: "已加密", false: "明文，仅开发用"}[password != ""])
 	}
 	log.Printf("[node] 矿工地址（公钥哈希）=%x", minerWallet.PubKeyHash())
 
@@ -339,11 +466,23 @@ func main() {
 		miner:       minerWallet,
 		pool:        mempool.New(),
 		syncer:      chainsync.New(chain),
+		store:       store,
 		peerHeights: make(map[string]int),
 		pending:     make(map[string]chan p2p.BlocksRespPayload),
 	}
 
 	p2pNode := p2p.NewNode(cfg.ListenAddr, svc)
+	if cfg.TLSEnabled {
+		if err := p2pNode.SetTLSOptions(p2p.TLSOptions{
+			Enabled:  true,
+			CertFile: cfg.TLSCertFile,
+			KeyFile:  cfg.TLSKeyFile,
+			CAFile:   cfg.TLSCAFile,
+		}); err != nil {
+			log.Fatalf("加载 mTLS 证书失败（拒绝以明文回退启动）: %v", err)
+		}
+		log.Printf("[p2p] mTLS 已启用")
+	}
 	svc.net = p2pNode
 	nodeID := fmt.Sprintf("hundun-%d-%d", time.Now().UnixNano(), os.Getpid())
 	p2pNode.SetLocalInfo(nodeID, chain.Height)

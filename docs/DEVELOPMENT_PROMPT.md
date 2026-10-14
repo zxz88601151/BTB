@@ -58,7 +58,7 @@ hundun/
 
 以下每张"任务卡片"都是独立可执行的开发任务，包含目标、验收标准、注意事项。建议按顺序推进。
 
-> **状态（2026-10-14）：六张卡已全部实现（`go build/vet/test` 全过 + 联调 `internal/integration` 通过），未推送。**
+> **状态（2026-10-14）：六张卡已全部实现（`go build/vet/test` 全过 + 联调 `internal/integration` 通过），已推送（`8c0dd27` 核心 + `b4c5d72` P2P/测试/文档）。**
 > 与卡片原文有出入处如实标注，不静默声称全合规：
 > - 卡 1：UTXO 为独立 `internal/utxo` 包（卡片说放 `blockchain` 内）；另新增 BIP-30 式防重复 Coinbase 校验（卡片未提，防相同 Coinbase TxID 碰撞覆盖 UTXO）。
 > - 卡 3：入池时**检查**池内双花冲突（卡片原文说“不看冲突”；本实现按无 RBF 直接拒绝冲突交易，更严）。

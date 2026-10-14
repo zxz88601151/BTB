@@ -1,4 +1,4 @@
-# P2PChain（骨架）
+# 混沌链（HUNDUN，骨架）
 
 一个类似比特币的点对点挖矿区块链项目骨架，Go 语言实现，零外部依赖（当前阶段只用标准库），支持普通电脑 CPU 挖矿。
 
@@ -48,7 +48,7 @@ go run ./cmd/node --listen :6689 --seed 127.0.0.1:6688
 ## 目录结构
 
 ```
-p2pchain/
+hundun/
 ├── cmd/node/main.go         # 程序入口
 ├── internal/
 │   ├── block/                # 区块 & Merkle树

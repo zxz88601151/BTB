@@ -14,7 +14,7 @@ import (
 	"encoding/hex"
 	"time"
 
-	"p2pchain/internal/transaction"
+	"hundun/internal/transaction"
 )
 
 // Header 区块头，挖矿时反复哈希的就是这部分内容序列化后的字节。

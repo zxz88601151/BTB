@@ -8,7 +8,7 @@ package pow
 import (
 	"math/big"
 
-	"p2pchain/internal/block"
+	"hundun/internal/block"
 )
 
 const (

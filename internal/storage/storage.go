@@ -9,7 +9,7 @@
 //   - 节点自身的钱包私钥（务必加密存储，绝不能明文落盘）
 package storage
 
-import "p2pchain/internal/block"
+import "hundun/internal/block"
 
 // BlockStore 区块存储接口。
 type BlockStore interface {

@@ -2,7 +2,7 @@
 data/
 
 # Build artifacts
-p2pchain
+hundun
 node
 *.exe
 *.test

@@ -1,4 +1,4 @@
-module p2pchain
+module hundun
 
 go 1.22
 

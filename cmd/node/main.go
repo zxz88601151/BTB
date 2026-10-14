@@ -17,13 +17,13 @@ import (
 	"log"
 	"time"
 
-	"p2pchain/internal/block"
-	"p2pchain/internal/blockchain"
-	"p2pchain/internal/config"
-	"p2pchain/internal/p2p"
-	"p2pchain/internal/pow"
-	"p2pchain/internal/transaction"
-	"p2pchain/internal/wallet"
+	"hundun/internal/block"
+	"hundun/internal/blockchain"
+	"hundun/internal/config"
+	"hundun/internal/p2p"
+	"hundun/internal/pow"
+	"hundun/internal/transaction"
+	"hundun/internal/wallet"
 )
 
 // BlockReward 每个区块的出块奖励（最小单位）。

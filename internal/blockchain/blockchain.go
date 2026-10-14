@@ -11,8 +11,8 @@ import (
 	"errors"
 	"fmt"
 
-	"p2pchain/internal/block"
-	"p2pchain/internal/pow"
+	"hundun/internal/block"
+	"hundun/internal/pow"
 )
 
 var (

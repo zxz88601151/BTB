@@ -16,6 +16,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"math/big"
+
+	"hundun/internal/transaction"
 )
 
 // Wallet 持有一对密钥：私钥用于签名（必须保密），公钥用于生成地址、供他人验签。
@@ -42,6 +44,31 @@ func (w *Wallet) PubKeyHash() [20]byte {
 	var hash [20]byte
 	copy(hash[:], sum[:20])
 	return hash
+}
+
+// PubKeyHashOf 计算给定公钥的公钥哈希（与 PubKeyHash 相同规则：SHA256 截断 20 字节）。
+// 供 UTXO / Mempool 校验时用（验签前先确认公钥哈希等于 UTXO 锁定的地址）。
+func PubKeyHashOf(pubKey []byte) [20]byte {
+	sum := sha256.Sum256(pubKey)
+	var hash [20]byte
+	copy(hash[:], sum[:20])
+	return hash
+}
+
+// SignTx 对一笔普通交易的所有输入签名：签名对象为 TxID（交易 Hash，
+// 签名/公钥本身不计入 TxID，故签名前后 TxID 稳定）。每个输入填入相同的签名与本钱包公钥。
+// 调用方须保证交易内容（输入引用 + 输出）已最终确定，签名后再改交易将使签名失效。
+// Coinbase 交易不调用本函数（Coinbase 的 Signature 为附带数据，不是签名）。
+func (w *Wallet) SignTx(tx *transaction.Transaction) error {
+	sig, err := w.Sign(tx.Hash())
+	if err != nil {
+		return err
+	}
+	for i := range tx.Inputs {
+		tx.Inputs[i].Signature = append([]byte(nil), sig...)
+		tx.Inputs[i].PubKey = append([]byte(nil), w.PublicKey...)
+	}
+	return nil
 }
 
 // Sign 对任意消息哈希做 ECDSA 签名，返回 (r, s) 拼接后的字节。

@@ -11,6 +11,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"math/big"
+	"runtime"
+	"sync"
+	"sync/atomic"
 
 	"hundun/internal/block"
 	"hundun/internal/params"
@@ -160,6 +163,66 @@ func Mine(b *block.Block, maxIterations uint64) (found bool, attempts uint64) {
 	// 未找到：将 Nonce 置为 0，避免残留中间值。
 	b.Header.Nonce = 0
 	return false, limit
+}
+
+// MineParallel 多核并行挖矿：Worker 池并行搜索 Nonce。
+// workers <= 0 时用 NumCPU。Nonce 空间分片：worker i 从 Nonce=i 起、按 workers 步进；
+// 任一 worker 找到解即停其他 worker（其 Nonce 写入块头）。
+// Nonce 空间耗尽未找到时返回 false，调用方须 Timestamp+1 重扫（与创世挖矿同规则）。
+// 返回尝试总次数（各 worker 尝试数之和，含找到解的那次）。
+func MineParallel(b *block.Block, workers int) (found bool, attempts uint64) {
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
+	if workers == 1 {
+		return Mine(b, 0)
+	}
+	target := BitsToTarget(b.Header.Bits)
+	targetB := targetBytes32(target)
+	header := b.Header.SerializeHeader()
+	if len(header) != 80 {
+		return Mine(b, 0)
+	}
+
+	var totalAttempts atomic.Uint64
+	var done atomic.Bool
+	foundCh := make(chan uint32, 1)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(start int) {
+			defer wg.Done()
+			buf := append([]byte(nil), header...)
+			var local uint64
+			for nonce := uint64(start); nonce < 1<<32; nonce += uint64(workers) {
+				// 有人已找到时退出（每 1024 次检查一次原子标志，避免每轮开销）。
+				if local%1024 == 0 && done.Load() {
+					break
+				}
+				binary.LittleEndian.PutUint32(buf[76:80], uint32(nonce))
+				first := sha256Sum(buf)
+				second := sha256Sum(first[:])
+				rev := reverseHash(second)
+				local++
+				if bytes.Compare(rev[:], targetB[:]) <= 0 {
+					if done.CompareAndSwap(false, true) {
+						foundCh <- uint32(nonce)
+					}
+					totalAttempts.Add(local)
+					return
+				}
+			}
+			totalAttempts.Add(local)
+		}(w)
+	}
+	wg.Wait()
+	close(foundCh)
+	if nonce, ok := <-foundCh; ok {
+		b.Header.Nonce = nonce
+		return true, totalAttempts.Load()
+	}
+	b.Header.Nonce = 0
+	return false, totalAttempts.Load()
 }
 
 // mineSlow 慢速兜底：逐轮调用 Header.Hash()（与 Validate 同路径）。

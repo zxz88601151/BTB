@@ -9,9 +9,15 @@ package p2p
 
 import (
 	"bufio"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"net"
 	"sync"
 	"time"
@@ -31,17 +37,21 @@ const (
 
 // Message 网络传输的通用消息信封，Payload 按 Type 不同解析成不同结构。
 // ID 为请求/响应关联用（同步 GetBlocks/BlocksResp 等），旧节点忽略本字段（JSON 未知字段兼容）。
+// Auth 为轻量消息签名（P4 常开）：对不含 Auth 的消息体签名；旧节点不发 Auth，
+// 接收方对无 Auth 的消息直接接受（向后兼容）；有 Auth 但验签失败的消息丢弃。
 type Message struct {
 	Type    MessageType     `json:"type"`
 	ID      string          `json:"id,omitempty"`
 	Payload json.RawMessage `json:"payload"`
+	Auth    *MessageAuth    `json:"auth,omitempty"`
 }
 
 // HandshakePayload 握手信息：让对方了解己方的基本状态。
 type HandshakePayload struct {
-	NodeID      string `json:"node_id"`
-	ChainHeight int    `json:"chain_height"`
-	ListenAddr  string `json:"listen_addr"` // 便于对方把我方地址转发给其他节点（节点发现）
+	NodeID          string `json:"node_id"`
+	ChainHeight     int    `json:"chain_height"`
+	ListenAddr      string `json:"listen_addr"`                // 便于对方把我方地址转发给其他节点（节点发现）
+	TransportPubKey []byte `json:"transport_pubkey,omitempty"` // 本节点传输签名公钥（65 字节未压缩 P-256）
 }
 
 // GetBlocksPayload 同步请求：从 FromHeight 开始取 Count 个块。
@@ -95,6 +105,15 @@ type Node struct {
 	nodeID     string
 	heightFunc func() int // 返回本地链高（握手用），未设置时为 0
 
+	// P4 mTLS 与轻量消息签名：transportPriv 为本节点传输签名私钥
+	// （节点启动时临时生成，仅用于消息来源认证，与钱包私钥无关，
+	// 公钥随握手交换；重启后更换，不作长期身份）。
+	tlsOpts       TLSOptions
+	tlsServerCfg  *tls.Config
+	tlsClientCfg  *tls.Config
+	transportPriv *ecdsa.PrivateKey
+	peerKeys      map[string]*ecdsa.PublicKey // 对端连接地址 -> 传输签名公钥（握手时登记）
+
 	mu          sync.Mutex
 	peers       map[string]net.Conn // 已建立连接的对等节点：地址 -> 连接
 	scores      map[string]int      // 对端评分（恶意行为累计）
@@ -105,14 +124,103 @@ type Node struct {
 
 // NewNode 创建一个节点，监听 listenAddr（例如 ":6688"）。
 func NewNode(listenAddr string, handler Handler) *Node {
+	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	return &Node{
-		listenAddr:  listenAddr,
-		handler:     handler,
-		peers:       make(map[string]net.Conn),
-		scores:      make(map[string]int),
-		bannedUntil: make(map[string]time.Time),
-		knownPeers:  make(map[string]time.Time),
+		listenAddr:    listenAddr,
+		handler:       handler,
+		peers:         make(map[string]net.Conn),
+		scores:        make(map[string]int),
+		bannedUntil:   make(map[string]time.Time),
+		knownPeers:    make(map[string]time.Time),
+		transportPriv: priv,
+		peerKeys:      make(map[string]*ecdsa.PublicKey),
 	}
+}
+
+// SetTLSOptions 配置 mTLS（P4）。Enabled=false 时为明文 TCP（默认，本地兼容）。
+// Enabled=true 时立即从文件加载证书，失败返回错误，节点不应以明文回退启动。
+func (n *Node) SetTLSOptions(opts TLSOptions) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.tlsOpts = opts
+	if !opts.Enabled {
+		n.tlsServerCfg, n.tlsClientCfg = nil, nil
+		return nil
+	}
+	serverCfg, err := TLSConfigFromFiles(opts.CertFile, opts.KeyFile, opts.CAFile)
+	if err != nil {
+		return err
+	}
+	clientCfg, err := TLSConfigFromFiles(opts.CertFile, opts.KeyFile, opts.CAFile)
+	if err != nil {
+		return err
+	}
+	clientCfg.ServerName = "localhost"
+	n.tlsServerCfg, n.tlsClientCfg = serverCfg, clientCfg
+	return nil
+}
+
+// signPayload 对不含 Auth 的消息体做 P-256 签名，固定 64 字节 r||s 拼接。
+func (n *Node) signPayload(unsigned []byte) ([]byte, error) {
+	n.mu.Lock()
+	priv := n.transportPriv
+	n.mu.Unlock()
+	if priv == nil {
+		return nil, fmt.Errorf("传输签名私钥未初始化")
+	}
+	digest := sha256.Sum256(unsigned)
+	r, s, err := ecdsa.Sign(rand.Reader, priv, digest[:])
+	if err != nil {
+		return nil, err
+	}
+	sig := make([]byte, 64)
+	r.FillBytes(sig[:32])
+	s.FillBytes(sig[32:])
+	return sig, nil
+}
+
+// signMessage 给一条消息附加 Auth 签名（对不含 Auth 的消息体签名）。
+func (n *Node) signMessage(msg Message) Message {
+	if n.nodeID == "" {
+		return msg // 未设 nodeID 时不签名（单测 / 旧路径兼容）
+	}
+	unsigned, err := json.Marshal(Message{Type: msg.Type, ID: msg.ID, Payload: msg.Payload})
+	if err != nil {
+		return msg
+	}
+	sig, err := n.signPayload(unsigned)
+	if err != nil {
+		return msg
+	}
+	msg.Auth = &MessageAuth{NodeID: n.nodeID, Signature: sig}
+	return msg
+}
+
+// verifyMessage 校验一条带 Auth 的消息：无 Auth 直接接受（旧节点兼容）；
+// 有 Auth 但对端公钥未知时接受（公钥随握手到达，握手本身不强制签名）；
+// 公钥已知且验签失败时返回 false，调用方丢弃该消息。
+func (n *Node) verifyMessage(peerAddr string, msg Message) bool {
+	if msg.Auth == nil {
+		return true
+	}
+	n.mu.Lock()
+	pub := n.peerKeys[peerAddr]
+	n.mu.Unlock()
+	if pub == nil {
+		return true
+	}
+	unsigned, err := json.Marshal(Message{Type: msg.Type, ID: msg.ID, Payload: msg.Payload})
+	if err != nil {
+		return false
+	}
+	digest := sha256.Sum256(unsigned)
+	sig := msg.Auth.Signature
+	if len(sig) != 64 {
+		return false
+	}
+	r := new(big.Int).SetBytes(sig[:32])
+	s := new(big.Int).SetBytes(sig[32:])
+	return ecdsa.Verify(pub, digest[:], r, s)
 }
 
 // SetLocalInfo 设置握手用的本节点 ID 与链高函数（链高函数由上层提供，握手时实时读取）。
@@ -131,8 +239,22 @@ func (n *Node) Addr() string {
 }
 
 // Start 启动监听，接受其他节点的入站连接。这是一个阻塞调用，通常放到单独的 goroutine 里跑。
+// TLSEnabled 时用 tls.Listen（mTLS 双向验证）；否则明文 TCP。
 func (n *Node) Start() error {
-	ln, err := net.Listen("tcp", n.listenAddr)
+	var ln net.Listener
+	var err error
+	n.mu.Lock()
+	serverCfg := n.tlsServerCfg
+	tlsOn := n.tlsOpts.Enabled
+	n.mu.Unlock()
+	if tlsOn {
+		if serverCfg == nil {
+			return fmt.Errorf("TLS 已启用但未配置证书（请先调 SetTLSOptions）")
+		}
+		ln, err = tls.Listen("tcp", n.listenAddr, serverCfg)
+	} else {
+		ln, err = net.Listen("tcp", n.listenAddr)
+	}
 	if err != nil {
 		return fmt.Errorf("监听失败: %w", err)
 	}
@@ -169,7 +291,13 @@ func (n *Node) sendHandshake(conn net.Conn) {
 	if heightFunc != nil {
 		height = heightFunc()
 	}
-	payload, _ := json.Marshal(HandshakePayload{NodeID: nodeID, ChainHeight: height, ListenAddr: listenAddr})
+	var pubBytes []byte
+	n.mu.Lock()
+	if n.transportPriv != nil {
+		pubBytes = elliptic.Marshal(elliptic.P256(), n.transportPriv.PublicKey.X, n.transportPriv.PublicKey.Y)
+	}
+	n.mu.Unlock()
+	payload, _ := json.Marshal(HandshakePayload{NodeID: nodeID, ChainHeight: height, ListenAddr: listenAddr, TransportPubKey: pubBytes})
 	msg := Message{Type: MsgHandshake, Payload: payload}
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -184,7 +312,20 @@ func (n *Node) ConnectToPeer(addr string) error {
 	if n.IsBanned(addr) {
 		return fmt.Errorf("对端 %s 仍在封禁期，拒绝连接", addr)
 	}
-	conn, err := net.Dial("tcp", addr)
+	var conn net.Conn
+	var err error
+	n.mu.Lock()
+	clientCfg := n.tlsClientCfg
+	tlsOn := n.tlsOpts.Enabled
+	n.mu.Unlock()
+	if tlsOn {
+		if clientCfg == nil {
+			return fmt.Errorf("TLS 已启用但未配置证书（请先调 SetTLSOptions）")
+		}
+		conn, err = tls.Dial("tcp", addr, clientCfg)
+	} else {
+		conn, err = net.Dial("tcp", addr)
+	}
 	if err != nil {
 		return fmt.Errorf("连接对等节点 %s 失败: %w", addr, err)
 	}
@@ -199,12 +340,16 @@ func (n *Node) ConnectToPeer(addr string) error {
 }
 
 // SendTo 向指定对端发送一条消息（同步请求等点对点消息用）。
+// 发送前附加轻量签名 Auth（握手消息本身不签名，避免公钥交换循环）。
 func (n *Node) SendTo(addr string, msg Message) error {
 	n.mu.Lock()
 	conn, ok := n.peers[addr]
 	n.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("未连接的对端: %s", addr)
+	}
+	if msg.Type != MsgHandshake {
+		msg = n.signMessage(msg)
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -294,7 +439,11 @@ func (n *Node) PeerScore(addr string) int {
 }
 
 // Broadcast 把一条消息发送给所有已连接的对等节点（跳过封禁对端）。
+// 发送前附加轻量签名 Auth（握手消息本身不签名）。
 func (n *Node) Broadcast(msg Message) {
+	if msg.Type != MsgHandshake {
+		msg = n.signMessage(msg)
+	}
 	data, err := json.Marshal(msg)
 	if err != nil {
 		log.Printf("[p2p] 序列化消息失败: %v", err)
@@ -348,6 +497,11 @@ func (n *Node) handleConn(conn net.Conn) {
 			log.Printf("[p2p] 解析来自 %s 的消息失败: %v", addr, err)
 			continue
 		}
+		// 轻量签名校验：验签失败的消息直接丢弃（不分发、不计分，避免误封）。
+		if !n.verifyMessage(addr, msg) {
+			log.Printf("[p2p] 来自 %s 的消息验签失败，已丢弃", addr)
+			continue
+		}
 
 		n.dispatch(addr, msg)
 	}
@@ -360,6 +514,14 @@ func (n *Node) dispatch(peerAddr string, msg Message) {
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 			log.Printf("[p2p] 解析握手消息失败: %v", err)
 			return
+		}
+		// 登记对端传输签名公钥（后续消息验签用）。
+		if len(payload.TransportPubKey) == 65 {
+			if x, y := elliptic.Unmarshal(elliptic.P256(), payload.TransportPubKey); x != nil {
+				n.mu.Lock()
+				n.peerKeys[peerAddr] = &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
+				n.mu.Unlock()
+			}
 		}
 		// 节点发现：记录对方监听地址，握手后回发本节点已知地址列表（Gossip）。
 		if payload.ListenAddr != "" {

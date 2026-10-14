@@ -86,6 +86,15 @@ const (
 	MedianTimeSpan = 11
 )
 
+// 显示层（非共识，仅钱包/CLI/文档显示用；代码符号仍 HUNDUN，Go module / 包名不动）。
+const (
+	// Ticker 交易/展示用 ticker：HDN。
+	Ticker = "HDN"
+
+	// DisplayUnit 中文显示单位：沌。1 沌 = 1 HUNDUN = 100_000_000 base units。
+	DisplayUnit = "沌"
+)
+
 // 手续费与粉尘（冻结表 §7）。
 const (
 	// MinRelayFeeRate 最低中继费率：1 base unit / 字节（1000 / kB）。策略层，非共识。

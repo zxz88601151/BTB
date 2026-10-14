@@ -9,6 +9,16 @@ type NodeConfig struct {
 	MinerEnabled bool     // 是否开启本地CPU挖矿
 	MinerAddress string   // 挖矿奖励接收地址（矿工公钥哈希的十六进制字符串）
 	DataDir      string   // 区块数据、钱包文件的存储目录
+
+	// 钱包口令文件（P2）：只走 --wallet-password-file，文件须为 0600 权限；
+	// 为空表示钱包文件不加密（开发调试用），生产必须配口令文件。
+	WalletPasswordFile string
+
+	// mTLS（P4）：默认关闭（本地开发兼容）；生产设 TLSEnabled=true 并配齐三个文件。
+	TLSEnabled  bool
+	TLSCertFile string
+	TLSKeyFile  string
+	TLSCAFile   string
 }
 
 // DefaultConfig 返回一份适合本地单机测试的默认配置。

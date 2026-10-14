@@ -5,6 +5,8 @@
 //   - 交易列表是本区块打包的所有交易
 //
 // 区块头单独定义是为了方便挖矿时只对区块头做哈希运算（不必每次都对全部交易重新哈希）。
+// 冻结布局（冻结表 V2 §2.3）：头恒 80 字节，定长小端，字段顺序 Version / PrevBlockHash /
+// MerkleRoot / Timestamp(uint32) / Bits(nBits) / Nonce(uint32)。
 package block
 
 import (
@@ -19,12 +21,12 @@ import (
 
 // Header 区块头，挖矿时反复哈希的就是这部分内容序列化后的字节。
 type Header struct {
-	Version       uint32 // 协议版本号，用于未来升级共识规则
+	Version       uint32   // 协议版本号，用于未来升级共识规则
 	PrevBlockHash [32]byte // 前一个区块头的哈希，构成链式结构
 	MerkleRoot    [32]byte // 本区块所有交易的 Merkle 根
-	Timestamp     int64    // 出块时间（Unix 秒）
-	Bits          uint32   // 压缩格式表示的难度目标（参考比特币的 nBits 编码）
-	Nonce         uint64   // 矿工在挖矿时不断调整的随机数
+	Timestamp     uint32   // 出块时间（Unix 秒，uint32，冻结表 §2.3）
+	Bits          uint32   // nBits 紧凑编码的难度目标（冻结表 §2.2）
+	Nonce         uint32   // 矿工在挖矿时不断调整的随机数（uint32，冻结表 §2.3）
 }
 
 // Block 完整区块 = 区块头 + 交易列表
@@ -40,7 +42,7 @@ func NewCandidateBlock(prevHash [32]byte, bits uint32, txs []*transaction.Transa
 		Header: Header{
 			Version:       1,
 			PrevBlockHash: prevHash,
-			Timestamp:     time.Now().Unix(),
+			Timestamp:     uint32(time.Now().Unix()),
 			Bits:          bits,
 			Nonce:         0,
 		},
@@ -50,8 +52,9 @@ func NewCandidateBlock(prevHash [32]byte, bits uint32, txs []*transaction.Transa
 	return b
 }
 
-// SerializeHeader 将区块头序列化为定长字节数组，供哈希函数使用。
+// SerializeHeader 将区块头序列化为定长 80 字节数组，供哈希函数使用。
 // 字段顺序和长度必须固定，否则不同节点计算出的哈希会不一致。
+// 布局：Version(4 LE) || PrevBlockHash(32) || MerkleRoot(32) || Timestamp(4 LE) || Bits(4 LE) || Nonce(4 LE)。
 func (h *Header) SerializeHeader() []byte {
 	buf := new(bytes.Buffer)
 	_ = binary.Write(buf, binary.LittleEndian, h.Version)
@@ -63,7 +66,7 @@ func (h *Header) SerializeHeader() []byte {
 	return buf.Bytes()
 }
 
-// Hash 计算区块头的双 SHA-256 哈希（沿用比特币的做法，可按需换成单次哈希或其它算法）。
+// Hash 计算区块头的双 SHA-256 哈希（BTC 做法）。
 func (h *Header) Hash() [32]byte {
 	first := sha256.Sum256(h.SerializeHeader())
 	second := sha256.Sum256(first[:])
@@ -74,6 +77,21 @@ func (h *Header) Hash() [32]byte {
 func (h *Header) HashHex() string {
 	hash := h.Hash()
 	return hex.EncodeToString(hash[:])
+}
+
+// Size 返回区块序列化尺寸（冻结表 §2.6 块大小用）：80 字节头 + 各交易序列化尺寸之和。
+// 交易尺寸见 transaction.SerializedSize（确定性定义，见该包注释）。
+func (b *Block) Size() int {
+	size := 80
+	for _, tx := range b.Transactions {
+		size += tx.SerializedSize()
+	}
+	return size
+}
+
+// Weight 返回区块权重（冻结表 §2.6）：无见证时 weight = size * 4。
+func (b *Block) Weight() int {
+	return b.Size() * 4
 }
 
 // ComputeMerkleRoot 计算交易列表的 Merkle 根。

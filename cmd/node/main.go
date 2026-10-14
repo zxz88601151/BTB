@@ -1,14 +1,13 @@
 // cmd/node 是节点的可执行程序入口。
 //
-// 骨架阶段的运行流程：
-//  1. 生成创世区块，初始化内存版区块链
+// 运行流程：
+//  1. 载入硬编码创世块（genesis 包），初始化内存版区块链
 //  2. 生成（或加载）矿工钱包
 //  3. 启动 P2P 监听 + 连接种子节点
 //  4. 起一个循环：不断打包交易池中的交易 + Coinbase 奖励，尝试挖矿；
 //     挖到区块后追加到本地链并向全网广播
 //
-// 这是单文件骨架，方便先跑通主流程；随着功能增加，建议把挖矿循环、消息处理
-// 拆分成独立的 service 结构体，main.go 只负责组装依赖（依赖注入）。
+// 创世块不再现场随机生成：创世块常量见 genesis 包，挖出回填前节点拒绝启动。
 package main
 
 import (
@@ -20,15 +19,13 @@ import (
 	"hundun/internal/block"
 	"hundun/internal/blockchain"
 	"hundun/internal/config"
+	"hundun/internal/genesis"
 	"hundun/internal/p2p"
+	"hundun/internal/params"
 	"hundun/internal/pow"
 	"hundun/internal/transaction"
 	"hundun/internal/wallet"
 )
-
-// BlockReward 每个区块的出块奖励（最小单位）。
-// 真实项目通常会设计"减半"机制（比特币每21万个区块奖励减半），此处先用固定值。
-const BlockReward = 50
 
 // nodeService 把区块链、钱包、网络粘合在一起，并实现 p2p.Handler 接口。
 type nodeService struct {
@@ -53,16 +50,6 @@ func (s *nodeService) OnNewTx(peerAddr string, raw json.RawMessage) {
 	// TODO: 反序列化交易 -> 校验签名与 UTXO 有效性 -> 放入内存交易池（Mempool）并继续转发
 }
 
-// buildGenesisBlock 构造创世区块：没有前置区块，直接给出一笔 Coinbase 奖励。
-func buildGenesisBlock(minerPubKeyHash [20]byte) *block.Block {
-	coinbase := transaction.NewCoinbaseTx(minerPubKeyHash, BlockReward)
-	genesis := block.NewCandidateBlock([32]byte{}, pow.MaxTargetBits, []*transaction.Transaction{coinbase})
-
-	// 创世区块也需要真正挖出来，保证哈希满足难度目标，逻辑上和普通区块一致
-	pow.Mine(genesis, 0)
-	return genesis
-}
-
 // mineLoop 是最核心的挖矿循环：组装候选区块 -> 挖矿 -> 成功则上链并广播 -> 重复。
 func mineLoop(s *nodeService) {
 	for {
@@ -74,13 +61,16 @@ func mineLoop(s *nodeService) {
 		}
 
 		// TODO: 这里应该从 Mempool 中挑选手续费最高的一批交易打包，骨架阶段只打包 Coinbase
-		coinbase := transaction.NewCoinbaseTx(s.miner.PubKeyHash(), BlockReward)
+		nextHeight := uint64(s.chain.Height() + 1)
+		coinbase := transaction.NewCoinbaseTx(s.miner.PubKeyHash(), params.GetBlockSubsidy(nextHeight))
 		candidate := block.NewCandidateBlock(tip.Header.Hash(), s.chain.CurrentBits(), []*transaction.Transaction{coinbase})
 
-		log.Printf("[miner] 开始挖矿，高度=%d，难度位数=%d", s.chain.Height()+1, candidate.Header.Bits)
+		log.Printf("[miner] 开始挖矿，高度=%d，Bits=0x%08x", nextHeight, candidate.Header.Bits)
 
 		// maxIterations 设置一个上限，避免长时间挖不到时无法响应"链尾已变化，需要重新组装候选区块"的情况；
 		// 生产实现建议用 goroutine + context 取消，而不是轮询迭代次数。
+		// 注意：pow.Mine 的 Nonce 为 uint32，超限未找到时返回 false，调用方重组装候选块后重试
+		// （重组装会刷新 Timestamp，相当于 Timestamp+1 重扫）。
 		found, attempts := pow.Mine(candidate, 5_000_000)
 		if !found {
 			log.Printf("[miner] 本轮 %d 次尝试未找到解，重新组装候选区块", attempts)
@@ -113,15 +103,22 @@ func main() {
 	cfg := config.DefaultConfig()
 	cfg.ListenAddr = *listenAddr
 
+	// 载入硬编码创世块（回填前拒绝启动，见 genesis 包）。
+	genesisBlock, err := genesis.GenesisBlock()
+	if err != nil {
+		log.Fatalf("载入创世块失败: %v（创世块须先挖矿回填 genesis 包的 Timestamp/Nonce/Hash/TxID）", err)
+	}
+	if err := blockchain.ValidateGenesisBlock(genesisBlock); err != nil {
+		log.Fatalf("创世块校验失败: %v", err)
+	}
+	chain := blockchain.NewBlockchainWithGenesis(genesisBlock)
+	log.Printf("[node] 创世区块哈希=%s", genesisBlock.Header.HashHex())
+
 	minerWallet, err := wallet.NewWallet()
 	if err != nil {
 		log.Fatalf("生成矿工钱包失败: %v", err)
 	}
 	log.Printf("[node] 矿工地址（公钥哈希）=%x", minerWallet.PubKeyHash())
-
-	genesis := buildGenesisBlock(minerWallet.PubKeyHash())
-	chain := blockchain.NewBlockchainWithGenesis(genesis)
-	log.Printf("[node] 创世区块哈希=%s", genesis.Header.HashHex())
 
 	svc := &nodeService{chain: chain, miner: minerWallet}
 

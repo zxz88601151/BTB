@@ -20,11 +20,11 @@ import (
 type MessageType string
 
 const (
-	MsgHandshake   MessageType = "handshake"    // 建立连接后的握手，交换版本号、链高度等信息
-	MsgNewBlock    MessageType = "new_block"    // 广播新挖出的区块
-	MsgNewTx       MessageType = "new_tx"       // 广播新的交易
-	MsgGetBlocks   MessageType = "get_blocks"   // 请求区块（用于新节点同步）
-	MsgBlocksResp  MessageType = "blocks_resp"  // 区块请求的响应
+	MsgHandshake  MessageType = "handshake"   // 建立连接后的握手，交换版本号、链高度等信息
+	MsgNewBlock   MessageType = "new_block"   // 广播新挖出的区块
+	MsgNewTx      MessageType = "new_tx"      // 广播新的交易
+	MsgGetBlocks  MessageType = "get_blocks"  // 请求区块（用于新节点同步）
+	MsgBlocksResp MessageType = "blocks_resp" // 区块请求的响应
 )
 
 // Message 网络传输的通用消息信封，Payload 按 Type 不同解析成不同结构。

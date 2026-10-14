@@ -4,11 +4,11 @@ package config
 
 // NodeConfig 单个节点的运行配置。
 type NodeConfig struct {
-	ListenAddr    string   // 本节点监听地址，例如 ":6688"
-	SeedPeers     []string // 启动时主动连接的种子节点列表
-	MinerEnabled  bool     // 是否开启本地CPU挖矿
-	MinerAddress  string   // 挖矿奖励接收地址（矿工公钥哈希的十六进制字符串）
-	DataDir       string   // 区块数据、钱包文件的存储目录
+	ListenAddr   string   // 本节点监听地址，例如 ":6688"
+	SeedPeers    []string // 启动时主动连接的种子节点列表
+	MinerEnabled bool     // 是否开启本地CPU挖矿
+	MinerAddress string   // 挖矿奖励接收地址（矿工公钥哈希的十六进制字符串）
+	DataDir      string   // 区块数据、钱包文件的存储目录
 }
 
 // DefaultConfig 返回一份适合本地单机测试的默认配置。
